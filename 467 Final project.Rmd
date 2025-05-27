@@ -1,0 +1,995 @@
+---
+title: "Housing Prediction"
+author: "Ngoc Nguyen"
+output: pdf_document
+---
+
+```{r, echo = F, message=F}
+#install.packages("fastDummies")
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(knitr)
+library(DT)
+library(tidyverse)
+library(tidyr)
+library(caret)
+library(kableExtra)
+```
+
+# I. Introduction
+
+Housing prediction is one of the most classical regression problem in machine learning world. In this project, I want to challenge myself with the Ames Housing dataset from Kaggle which was a more modernized and expanded version of the often cited Boston Housing dataset.
+
+So far, the valuation of residential properties extends far beyond conventional metrics such as bedroom count or aesthetic features like white picket fences or the proximity to an east-west railroad. With an extensive collection of 79 explanatory variables documenting comprehensive aspects of housing properties in this dataset, housing price negotiations are shown to be influenced by numerous less obvious factors that might escape immediate attention—such as basement ceiling height or number of bathrooms. 
+
+The primary objective of this modeling exercise is to accurately predict the final sale price of each residence based on these diverse property characteristics, developing a robust predictive framework that captures both obvious and subtle pricing determinants. Ultimately, this study can help house buyers/renters and investors have more insights into the real estate scene.
+
+# II. Methodology
+
+## 2.1 Data
+
+This dataset comes from a Kaggle competition - called House Prices - Advanced Regression Techniques. Our target variable is `SalePrice`. It contains 1,460 observations of 79 explanatory variables (excluding id and saleprice columns) which describe (almost) every aspect of residential homes in Ames, Iowa. Every observation is unique. There is no more additional information about collecting the data. 
+
+To get in-depth information about the competition description and data structure, please refer to this link:
+
+[\color{blue} \underline {Kaggle House Prices - Advanced Regression Techniques} ](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/overview)
+
+```{r, echo = F}
+data <- read.csv("train.csv")
+head(data)
+str(data)
+```
+### 2.1.1 Data Cleaning
+
+#### Data Inspection
+
+First, the Id column is not needed.
+
+```{r}
+data <- data %>%
+  select(-Id)
+#   select(-Id) %>%
+#   mutate(MSSubClass = as.character(MSSubClass),
+#          OverallQual = factor(OverallQual), 
+#          OverallCond = factor(OverallCond)) 
+# str(data)
+```
+
+
+#### Handling Missing Values:
+
+Glimpsing through the dataset, I see many missing values here. Let's take a look at the percentage of missing values are within each columns.
+
+```{r}
+df <- data.frame(colSums(is.na(data)))
+
+df <- df %>%
+  mutate(`Missing Percentage`= round(colSums.is.na.data..*100/nrow(data), 6)) %>%
+  arrange(desc(`Missing Percentage`)) %>%
+  mutate(`Missing Percentage` = paste(`Missing Percentage`, "%")) %>%
+  select(-colSums.is.na.data..)
+
+knitr::kable(df)
+```
+
+Here `PoolQC`, `MiscFeature`, `Alley` and `Fence` have very high percentage of missing values (>80%), we can ignore these variables and drop them from our process. And they can't be imputed either because they are quality measure that needs customer opinion input (things we shouldn't make up). 
+
+```{r}
+data <- data %>%
+  select(-PoolQC, -MiscFeature, -Alley, -Fence)
+```
+
+
+#### Variable Investigation
+
+For more convenient processing, I will partition the variables into 2 groups: numeric and categorical. 
+```{r}
+# Select categorical (character/factor) columns
+cat_columns_df <- data %>% select(where(~ is.character(.x) || is.factor(.x)))
+
+# Select numerical columns
+num_columns_df <- data %>% select(where(is.numeric))
+
+# recheck the types of the categorical features
+sapply(cat_columns_df, class)
+```
+
+```{r}
+# recheck the types of the numerical features
+sapply(num_columns_df, class)
+```
+
+##### Handling categorical variables first:
+
+```{r}
+# Number of NA values in each categorical (object) column
+na_counts <- sapply(cat_columns_df, function(x) sum(is.na(x)))
+na_counts
+```
+
+We will fill null values of `BsmtQual`, `BsmtCond`, `BsmtExposure`, `BsmtFinType1`, `BsmtFinType2`, `GarageType`, `GarageFinish`, `GarageQual`, `FireplaceQu`, `GarageCond` with "NA" as this matches data description - which is literally NA - "No Basement/Fireplace/Garage". Don't be confused with NA/Null value. For the other features that have minimal number of missing values (=/> 1), we will fill them with their most frequent value.
+
+```{r}
+# Columns to fill with "NA" for structural missingness
+columns_NA <- c('BsmtQual','BsmtCond','BsmtExposure','BsmtFinType1','BsmtFinType2',
+                  'GarageType','GarageFinish','GarageQual','FireplaceQu','GarageCond')
+
+cat_columns_df <- cat_columns_df %>%
+  mutate(across(all_of(columns_NA), ~ replace_na(.x, "NA"))) 
+
+# Columns to fill with most frequent (mode) value
+columns_with_lowNA <- c('MasVnrType','Electrical')
+
+# Define mode function
+mode_func <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]}
+
+# fill missing values for MasVnrType and Electrical
+cat_columns_df <- cat_columns_df %>%
+  mutate(across(all_of(columns_with_lowNA), ~ replace_na(.x, mode_func(.x))))
+```
+
+Now we check for final distribution in each feature to check for class imbalance and also verify the changes we just made above.
+
+```{r}
+# Automatically get all the column names from cat_columns_df
+cols_to_tabulate <- names(cat_columns_df)
+
+# Loop through and print tables for all categorical columns
+for (col in cols_to_tabulate) {
+  cat("\n\n==== Table for:", col, "====\n")
+  print(table(cat_columns_df[[col]]))}
+```
+
+`Street`, `Utilities`, `Condition2`, `RoofMatl` and `Heating` show very extreme imbalance in value distribution. These features thus provide very little discriminative power for our model. So we will remove these variables.
+
+```{r}
+cat_columns_df <- select(cat_columns_df, -c(Street, Utilities, RoofMatl, Condition2))
+```
+
+##### Label Encoding categorical variables
+
+Because machine learning models (especially linear models and tree models) strictly require numeric input, we need to transform the categorical variables into numeric input. There are 3 ways to do encoding, including: 
+
+- One-hot encoding: Creating binary columns for each category
+- Label encoding: Assigning integers to each category (0, 1, 2, etc.)
+- Target encoding: Replacing categories with statistics based on the target variable.
+
+Examining the description of data, there are some categorical variables that deal with quality, conditions, etc.(ExterQual, BsmtQual) and have an intrinsic order (e.g., Excellent > Good > Average > Poor), so label encoding with meaning makes sense for them.
+
+```{r}
+# First: Fix Gd in BsmtExposure to Good otherwise we will have 2 Gd keys in the map
+cat_columns_df <- cat_columns_df %>%
+  mutate(BsmtExposure = recode(BsmtExposure, "Gd" = "Good"))
+
+# Main mapping for quality/condition columns
+bin_map <- c(
+  "TA" = 2, "Gd" = 3, "Fa" = 1, "Ex" = 4, "Po" = 1, "NA" = 0, #qual, cond
+  "Y" = 1, "N" = 0, #centralair
+  "Reg" = 3, "IR1" = 2, "IR2" = 1, "IR3" = 0, #lotshape
+  "No" = 2, "Mn" = 2, "Av" = 3, "Good" = 4, #BsmtExposure
+  "Unf" = 1, "LwQ" = 2, "Rec" = 3, "BLQ" = 4, "ALQ" = 5, "GLQ" = 6) #BsmtFinType1,2
+
+# Separate mapping for PavedDrive
+paved_drive_map <- c("N" = 0, "P" = 1, "Y" = 2)
+
+# List of columns using bin_map
+columns_to_map <- c(
+  "ExterQual", "ExterCond", "BsmtCond", "BsmtQual",
+  "HeatingQC", "KitchenQual", "FireplaceQu",
+  "GarageQual", "GarageCond", "CentralAir",
+  "LotShape", "BsmtExposure", "BsmtFinType1", "BsmtFinType2")
+
+#apply the mapping
+cat_columns_df <- cat_columns_df %>%
+  mutate(across(all_of(columns_to_map), ~ bin_map[.])) %>%
+  mutate(PavedDrive = paved_drive_map[PavedDrive])
+```
+
+For the rest of categorical feature, we will use **One Hot Encoder** to encode these values.
+
+```{r}
+library(fastDummies)
+
+# Select the rest var which are only categorical columns (character or factor)
+rest_cat_columns <- cat_columns_df %>%
+  select(where(~ is.factor(.) | is.character(.))) 
+rest_cat_columns
+
+# One-hot encode them
+cat_columns_df <- fastDummies::dummy_cols(cat_columns_df,
+                                             select_columns = names(rest_cat_columns),
+                                             remove_selected_columns = TRUE)
+head(cat_columns_df)
+```
+
+##### Handling numeric variables:
+
+```{r}
+# Number of NA values in each numerical column
+na_counts_num <- sapply(num_columns_df, function(x) sum(is.na(x)))
+na_counts_num
+```
+
+Here, `MasVnrArea`, `LotFrontage`, and `GarageYrBlt` have lots of NA values. Looking at the value of MasVnrArea, we need to change NA to 0 as they are just area measurements, no special meaning/labels there. For `LotFrontage`, and `GarageYrBlt`, I will need to impute them. Examine the distribution of these variables below to determine how to impute:
+
+```{r, warning=F}
+# Fill missing MasVnrArea with 0 
+num_columns_df <- num_columns_df %>%
+  mutate(MasVnrArea = ifelse(is.na(MasVnrArea), 0, MasVnrArea))
+
+library(ggplot2)
+
+# Density plot for LotFrontage
+ggplot(num_columns_df, aes(x = LotFrontage)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  labs(title = "Density Plot of LotFrontage",
+       x = "LotFrontage",
+       y = "Density") +
+  theme_minimal(base_size = 14)
+
+# Density plot for GarageYrBlt
+ggplot(num_columns_df, aes(x = GarageYrBlt)) +
+  geom_density(fill = "lightgreen", alpha = 0.5) +
+  labs(title = "Density Plot of GarageYrBlt",
+       x = "GarageYrBlt",
+       y = "Density") +
+  theme_minimal(base_size = 14)
+```
+
+These variables have very skewed distribution so I will use median as our imputation strategy for missing `LotFrontage` and `GarageYrBlt`.
+
+```{r}
+# Calculate medians
+median_garage_year <- median(num_columns_df$GarageYrBlt, na.rm = TRUE) #1980
+median_lot_frontage <- median(num_columns_df$LotFrontage, na.rm = TRUE) #69
+
+# Fill missing GarageYrBlt with 1980
+num_columns_df$GarageYrBlt[is.na(num_columns_df$GarageYrBlt)] <- 1980
+
+# Fill missing LotFrontage with 69
+num_columns_df$LotFrontage[is.na(num_columns_df$LotFrontage)] <- 69
+```
+
+###### Feature Engineering 
+
+Looking closer at the data, I can see there is strict connection between some variables and that we can derive a new feature from them so they will look less discrete overall, for example: can subtract YrSold to YrBuilt to have `houseage`. Things like these can provide stronger signals to the ML algorithms later and also help to reduce model complexity and training time as we can drop their original measurements. 
+
+```{r}
+# Remove leading X in 2 columns 1stFlrSf and 2ndFlrSf have a leading X as it was transformed when being loaded to R (R does that)
+names(num_columns_df) <- gsub("^X", "", names(num_columns_df))
+
+# Create new engineered features
+num_columns_df <- num_columns_df %>%
+  mutate(
+    houseage = YrSold - YearBuilt,
+    houseremodelage = YrSold - YearRemodAdd,
+    totalsf = `1stFlrSF` + `2ndFlrSF` + BsmtFinSF1 + BsmtFinSF2,
+    totalarea = GrLivArea + TotalBsmtSF,
+    totalbaths = BsmtFullBath + FullBath + 0.5 * (BsmtHalfBath + HalfBath),
+    totalporchsf = OpenPorchSF + `3SsnPorch` + EnclosedPorch + ScreenPorch + WoodDeckSF)
+
+# Drop the original columns used to build the new features
+num_columns_df <- num_columns_df %>%
+  select(
+    -YrSold, -YearBuilt, -YearRemodAdd, 
+    -`1stFlrSF`, -`2ndFlrSF`, -BsmtFinSF1, -BsmtFinSF2, 
+    -GrLivArea, -TotalBsmtSF,
+    -BsmtFullBath, -FullBath, -BsmtHalfBath, -HalfBath,
+    -OpenPorchSF, -`3SsnPorch`, -EnclosedPorch, -ScreenPorch, -WoodDeckSF)
+head(num_columns_df)
+```
+
+###### Check correlation coefficients of these numeric values
+
+To further reduce the dimensions of this dataset, I examine the correlation matrix of these numeric values:
+
+```{r}
+# Calculate correlation matrix
+corr_mtx <- cor(num_columns_df, use = "pairwise.complete.obs")
+# Visualize with a heatmap
+library(corrplot)
+
+corrplot(corr_mtx, method = "color", type = "full", 
+         tl.cex = 0.7, tl.col = "black")
+```
+
+```{r}
+# turn mtx to tidy table for easy viz
+correlation_table <- corr_mtx %>%
+  as.data.frame() %>%
+  mutate(var1 = rownames(.)) %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation")
+
+# Clean by remove self-correlations and duplicate pairs
+correlation_table_clean <- correlation_table %>%
+  filter(var1 != var2) %>%
+  rowwise() %>%
+  mutate(pair = paste(sort(c(var1, var2)), collapse = "_")) %>%
+  ungroup() %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  select(var1, var2, correlation)
+
+# Sort by absolute correlation strength
+top_correlations <- correlation_table_clean %>%
+  mutate(abs_corr = abs(correlation)) %>%
+  arrange(desc(abs_corr))
+
+# View top 10
+head(top_correlations, 10)
+```
+
+Here `GarageCars` and `GarageArea` are highly correlated, we can drop 1 of them. By checking their correlation score with the target variable, we decided to drop `GarageArea` as it can explain less of the `SalePrice`.
+
+```{r}
+corr_mtx["GarageCars", "SalePrice"]
+corr_mtx["GarageArea", "SalePrice"]
+num_columns_df <- select(num_columns_df, -GarageArea)
+```
+
+
+**Now both the categorical and numeric variables were cleanly processed. We can concat them back as final training set.**
+
+```{r}
+# Concatenate columns
+final <- bind_cols(cat_columns_df, num_columns_df)
+
+# View first few rows
+head(final)
+#str(final)
+```
+
+# III. Results
+
+## 3.1 Exploratory Data Analysis
+
+### 3.1.1 Plotting Categorical Variables
+
+Since there are so many variables (170 categorical variables), I will only do some exploration into some determining factors that people usually based on when making house-buying decisions. First is the general zoning of the house sale, that is, how the land where the house is built is legally designated to be used, for example: for farming purpose, for commercial purpose, residential purpose, etc.
+
+```{r, fig.height=4.5, fig.width=7}
+# MSZoning vs SalePrice
+# Create a TEMPORARY data frame for plotting only
+plot_df <- final %>%
+  mutate(MSZoning = case_when(
+    `MSZoning_C (all)` == 1 ~ "C (all)",
+    MSZoning_FV == 1 ~ "FV",
+    MSZoning_RH == 1 ~ "RH",
+    MSZoning_RL == 1 ~ "RL",
+    MSZoning_RM == 1 ~ "RM",
+    TRUE ~ NA_character_))
+
+# plot from plot_df
+ggplot(plot_df, aes(x = MSZoning, y = SalePrice, fill = MSZoning)) +
+  geom_boxplot() +
+  labs(title = "SalePrice Distribution by MSZoning",
+       x = "MSZoning Category", y = "SalePrice") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Pastel1")  
+```
+
+The above plot FV(Floating Village Residential) has overall higher sale price than the other types of land, it is also less variable. In contrast, RL (residential low density) land is highly variable and has lots of outliers. This is important to keep in mind if later we want to improve model performance (by dropping outliers that inflate the errors).
+
+\vspace{12pt}
+
+```{r, fig.height=3, fig.width=7}
+#  Create temporary data frame for plotting
+plot_df <- final %>%
+  mutate(BldgType = case_when(
+    BldgType_1Fam == 1 ~ "1Fam",
+    BldgType_2fmCon == 1 ~ "2fmCon",
+    BldgType_Duplex == 1 ~ "Duplex",
+    BldgType_Twnhs == 1 ~ "Twnhs",
+    BldgType_TwnhsE == 1 ~ "TwnhsE",
+    TRUE ~ NA_character_))
+
+# plot: SalePrice by Building Type
+ggplot(plot_df, aes(x = BldgType, y = SalePrice, fill = BldgType)) +
+  geom_boxplot() +
+  labs(title = "SalePrice Distribution by Building Type",
+       x = "Building Type", y = "SalePrice") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Looking at the distribution of building/dwelling type, it's clear that 1Fam(single-family detached) type has the most and highest housing sales and they are very right-skewed. Next, it will be a miss if we don't try to see people references on the places/venues that are easily accessible from their homes.
+
+```{r, fig.height=4, fig.width=7}
+plot_df <- final %>%
+  mutate(Neighborhood = case_when(
+    Neighborhood_Blmngtn == 1 ~ "Bloomington Heights",
+    Neighborhood_Blueste == 1 ~ "Bluestem",
+    Neighborhood_BrDale == 1 ~ "Briardale",
+    Neighborhood_BrkSide == 1 ~ "Brookside",
+    Neighborhood_ClearCr == 1 ~ "Clear Creek",
+    Neighborhood_CollgCr == 1 ~ "College Creek",
+    Neighborhood_Crawfor == 1 ~ "Crawford",
+    Neighborhood_Edwards == 1 ~ "Edwards",
+    Neighborhood_Gilbert == 1 ~ "Gilbert",
+    Neighborhood_IDOTRR == 1 ~ "Iowa DOT and Rail Road",
+    Neighborhood_MeadowV == 1 ~ "Meadow Village",
+    Neighborhood_Mitchel == 1 ~ "Mitchell",
+    Neighborhood_NAmes == 1 ~ "North Ames",
+    Neighborhood_NoRidge == 1 ~ "Northridge",
+    Neighborhood_NPkVill == 1 ~ "Northpark Villa",
+    Neighborhood_NridgHt == 1 ~ "Northridge Heights",
+    Neighborhood_NWAmes == 1 ~ "Northwest Ames",
+    Neighborhood_OldTown == 1 ~ "Old Town",
+    Neighborhood_SWISU == 1 ~ "South & West of Iowa State University",
+    Neighborhood_Sawyer == 1 ~ "Sawyer",
+    Neighborhood_SawyerW == 1 ~ "Sawyer West",
+    Neighborhood_Somerst == 1 ~ "Somerset",
+    Neighborhood_StoneBr == 1 ~ "Stone Brook",
+    Neighborhood_Timber == 1 ~ "Timberland",
+    Neighborhood_Veenker == 1 ~ "Veenker",
+    TRUE ~ NA_character_))
+
+# Calculate mean SalePrice per Neighborhood
+neighborhood_means <- plot_df %>%
+  group_by(Neighborhood) %>%
+  summarise(Mean_SalePrice = mean(SalePrice, na.rm = TRUE)) %>%
+  arrange(desc(Mean_SalePrice))
+
+# plot Bar plot
+ggplot(neighborhood_means, aes(x = reorder(Neighborhood, Mean_SalePrice), y = Mean_SalePrice, fill = Neighborhood)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Mean SalePrice by Neighborhood",
+       x = "Neighborhood",
+       y = "Mean SalePrice") +
+  coord_flip() +   # Flip for easier reading
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+From the plot, Northride, Northride Heights, and Stone Brook are the top 3 Ames locations that people want to live close to.
+
+### 3.1.2. Plotting Numerical Variables
+
+First, have a look back at the correlation matrix between `SalePrice` and other predictors.
+
+```{r, warning=F}
+# Extract correlation with SalePrice
+saleprice_corr <- corr_mtx[,"SalePrice"]
+
+# Remove SalePrice itself
+saleprice_corr <- saleprice_corr[names(saleprice_corr) != "SalePrice"]
+
+# Sort by absolute correlation
+top_corr_vars <- saleprice_corr %>%
+  abs() %>%
+  sort(decreasing = TRUE) %>%
+  head(10)
+
+# Create a nice dataframe
+top_corr_vars_df <- data.frame(
+  Variable = names(top_corr_vars),
+  Correlation_with_SalePrice = round(top_corr_vars, 3))
+
+# View the table nicely
+kable(top_corr_vars_df, caption = "Top Variables Most Correlated with SalePrice")
+```
+
+From the correlation matrix created above, we want to examine closer the relationship between `SalePrice` and its most correlated predictors (r > 0.65), including `OverallQual`, `Garagecars` and `totalarea`.
+
+```{r}
+# plot overall quality
+ggplot(final, aes(x = factor(OverallQual), y = SalePrice)) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", aes(group = 1), color = "red") +
+  labs(title = "Relationship Between Overall Quality and SalePrice",
+       x = "Overall Quality (1 = Very Poor, 10 = Very Excellent)",
+       y = "SalePrice") +
+  theme_minimal()
+```
+
+Clearly, there is a strong positive association between `SalePrice` and `OverallQual`, the higher the quality of home is evaluated, the higher the sale price of that home. It's also shown that there are less and less choice for the higher quality houses.
+
+```{r}
+# Scatterplot: TotalArea vs SalePrice
+ggplot(final, aes(x = totalarea, y = SalePrice)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "SalePrice vs Total Area",
+       x = "Total Area (Above + Basement)",
+       y = "SalePrice") +
+  theme_minimal()
+
+# Scatterplot: GarageCars vs SalePrice
+ggplot(final, aes(x = GarageCars, y = SalePrice)) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "SalePrice vs GarageCars",
+       x = "Number of Garage Cars",
+       y = "SalePrice") +
+  theme_minimal()
+```
+
+From the plots, `totalarea` - which measures the total square feet of living area (including both ground and basement) and `Garagecars` - the number of cars the garage can house are very strong indicator of `SalePrice` too. We see some very concerning outliers/high influencing points in `totalarea` plot.
+
+### 3.1.3 Response Variable
+
+Below is population distribution of our response variable - `SalePrice`. It is heavily right-skewed. So we want to see how the density might change if we apply a log transformation. Here I used the log1p (log(1+y)) instead of just natural log (log(y)) because it is adding 1 to safely transforming sale price that has zero values.
+
+```{r, fig.height=3, fig.width=7}
+library(patchwork)  # For side-by-side plots
+
+# Original SalePrice histogram
+p1 <- ggplot(final, aes(x = SalePrice)) +   
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "Original SalePrice Distribution",
+       x = "SalePrice",
+       y = "Count") +
+  theme_minimal()
+
+# Log-transformed SalePrice histogram
+p2 <- ggplot(final, aes(x = log1p(SalePrice))) +
+  geom_histogram(bins = 30, fill = "lightgreen", color = "black") +
+  labs(title = "Log1p(SalePrice) Distribution",
+       x = "log(1 + SalePrice)",
+       y = "Count") +
+  theme_minimal()
+
+# Display side-by-side
+p1 + p2
+```
+
+After taking log transformation, the distribution looks normal now. This can benefit many models, especially the parametric ones. Other benefits of using log transformation includes:
+- Scale sensitivity: some models (linear regression, neural networks) are very sensitive to the scale of the target variable. Here log prices narrow the range.
+- Homoscedasticity: Log transformation often makes the error variance more constant across the price range, which is an assumption especially for (generalized) linear models.
+- Interpretability: In real estate, percentage errors are often more meaningful than absolute errors (a $10K error on a $100K house is more significant than on a $1M house).
+
+**In conclusion, I will use the transformed y for my model training.**
+
+## 3.2 Training/ Predictive Analysis 
+
+```{r, echo = F}
+set.seed(05112025)
+# Transform y
+final$SalePrice <- log1p(final$SalePrice)
+
+trainIndex <- sample(nrow(final), 0.8*nrow(final))
+train <- final[trainIndex, ]
+dim(train)
+test <- final[-trainIndex, ]
+dim(test)
+
+# Prepare test data
+y_true <- test$SalePrice               # true SalePrice
+y_test <- test$SalePrice   #used in XGBoost finding early stopping
+test <- test %>% select(-SalePrice)  # predictors only
+```
+
+After data cleaning process, there are a total of 1460 observations and 194 predictors in our study. I utilize a 80/20 train-test split for training model as it's an adequate proportion (as compared to 70/30) to train models that need lots of data to learn well, all models will be trained on the same 1168 observations and tested on 294 observations. To evaluate the model's performance and assess its ability to generalize, a 5-fold cross-validation strategy was employed for all models except Random Forest, which used the "Out-of-Bag" Estimation method. All models will preprocess their feature inputs with centering and scaling because they are all on different scales and that will affect models that are vulnerable to comparing distance (SVM) and matrix multiplication (neurel nets). After scaling, the variables will have mean 0 and standard deviation 1. 
+ 
+### 3.2.1. LASSO Regression Model
+
+**The shape of the training data is 1460*194, indicating pretty high feature-to-observation ratio. This can increase overfitting risk, especially if using complex models like neural networks or random forests. Also, computational efficiency will not be as good since training time increases with feature count and cross-validation will become much more expensive. So LASSO is a good algorithm to deal with this problem as its primary goal is to select features.**
+
+```{r, warning=F}
+library(glmnet)
+set.seed(05112025)
+
+# Define 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# LASSO model
+cat("Training LASSO Model...\n")
+start_time_lasso <- Sys.time()
+
+lasso_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "glmnet",
+  preProcess = c("center", "scale"),
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    alpha = 1,
+    lambda = seq(0, 5, length=100)))
+
+end_time_lasso <- Sys.time()
+cat("LASSO Training Time:", round(difftime(end_time_lasso, start_time_lasso, units = "mins"), 2), "minutes\n\n")
+```
+
+```{r}
+# evaluate
+# Predict using the trained lasso_model
+pred_lasso <- predict(lasso_model, newdata = test)
+
+# Compute RMSE
+lasso_rmse <- sqrt(mean((y_true - pred_lasso)^2))
+cat("Test RMSE for LASSO Model:", round(lasso_rmse, 4), "\n")
+
+# Extract best tuning parameters
+best_lasso_param <- lasso_model$bestTune
+
+# Display nicely with kable
+kable(best_lasso_param, caption = "Best Tuning Parameter for LASSO Model (Selected by 5-Fold CV)")
+```
+
+
+Using LASSO, test RMSE = 0.1534. Cross-validation (CV) decided that the best alpha is 1, but best lambda = 0, meaning this model behaves like regular OLS (ordinary least squares regression), so no penalty was applied at all. I also tested with very small lambda (= 0.0001) to force some shrinkage always, but then the best lambda is still that smallest value. So original data already fits well with no penalty.
+
+### 3.2.2. Elastic Net Model
+
+I also want to try Elastic Net - the combination of the strengths of L1 regularization (which encourages sparse solutions by setting some coefficients to zero) and L2 regularization (which shrinks the coefficients towards zero). Tuning parameters were set the same as in LASSO.
+
+```{r, warning=F}
+# Elastic Net model
+set.seed(05112025)
+
+# Define 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# Train Elastic Net model
+cat("Training Elastic Net Model...\n")
+start_time_enet <- Sys.time()
+
+elasticnet_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "glmnet",
+  preProcess = c("center", "scale"),
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    alpha = seq(0, 1, length = 10),  # Elastic Net: alpha between 0 and 1
+    lambda = seq(0, 5, length = 100) #same as in LASSO
+  ))
+
+end_time_enet <- Sys.time()
+cat("Elastic Net Training Time:", round(difftime(end_time_enet, start_time_enet, units = "mins"), 2), "minutes\n\n")
+
+# Predict using the trained elasticnet_model
+pred_enet <- predict(elasticnet_model, newdata = test)
+
+# Compute RMSE
+elasticnet_rmse <- sqrt(mean((y_true - pred_enet)^2))
+cat("Test RMSE for Elastic Net Model:", round(elasticnet_rmse, 4), "\n")
+
+# Extract best tuning parameters
+best_enet_param <- elasticnet_model$bestTune
+
+# Display nicely with kable
+kable(best_enet_param, caption = "Best Tuning Parameter for Elastic Net Model (Selected by 5-Fold CV)")
+```
+
+Using ElasticNet, test RMSE = 0.1434. Cross-validation (CV) results in best alpha is 0.1, lambda = 0.051.
+
+### 3.2.3. Random Forest 
+
+The third model that is used in this report is Random Forest. The reason to use RF is that there are many predictors with complex interactions that I'm not sure about and potentially non-linearity relationships between the predictors and the response in the dataset. I'm also concerned about overfitting of this data as there are so many predictors. RF allows ensemble of small decision trees that help reduce overfitting. Lastly, in EDA, we observed a lot of strong outliers which are concerning to the assumptions of building many models. And random forests usually can handle outliers very well. As stated, validation method that was used to estimate the model's performance is OOB - "Out-of-Bag" Estimation. In fact, we can skip splitting data into testing and training set here, but I would like to still separate them to compute test RMSE for model comparison later. Below is the function for building a random forest model.
+
+```{r}
+set.seed(05112025)
+# Regression mtry: sqrt(194) ~ 14
+# Train Random Forest model
+cat("Training Random Forest Model with OOB...\n")
+start_time_rf <- Sys.time()
+
+rf_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "rf",
+  preProcess = c("center", "scale"), 
+  trControl = trainControl(method = "oob"),
+  tuneGrid = expand.grid(
+    mtry = seq(5, 50, by = 5)),   
+  ntree = 100)   # grow 100 trees 
+
+end_time_rf <- Sys.time()
+cat("Random Forest Training Time (OOB):", round(difftime(end_time_rf, start_time_rf, units = "mins"), 2), "minutes\n\n")
+
+# Predict using trained Random Forest model
+pred_rf <- predict(rf_model, newdata = test)
+
+# Compute RMSE
+rf_rmse <- sqrt(mean((y_true - pred_rf)^2))
+cat("Test RMSE for Random Forest Model (OOB-trained):", round(rf_rmse, 4), "\n")
+# Extract best tuning parameter
+best_rf_param <- rf_model$bestTune
+# Display nicely
+kable(best_rf_param, caption = "Best Tuning Parameter for Random Forest Model (OOB Estimated)")
+```
+
+Using RandomForest, test RMSE = 0.1391. Cross-validation (CV) results in best mtry = 40, meaning best performance is reached when randomly selecting 40 features (columns) at each split of a tree. Later on, if we want to experiment tuning more mtry, it's beneficial to see when OOB RMSE stops improving. 
+
+```{r, warning=F}
+library(randomForest)
+# Manually separate predictors and response because Formula parsing fails after some var being encoded
+x_train_rf <- train %>% select(-SalePrice)
+y_train_rf <- train$SalePrice
+
+# Train RF manually
+rf_oob_curve <- randomForest(
+  x = x_train_rf,
+  y = y_train_rf,
+  mtry = rf_model$bestTune$mtry, # use the best mtry from caret tuning!
+  ntree = 100,
+  importance = TRUE,
+  keep.inbag = TRUE)
+
+# Plot OOB Error vs Number of Trees
+plot(rf_oob_curve$mse, 
+     type = "l", 
+     xlab = "Number of Trees",
+     ylab = "OOB Mean Squared Error (MSE)", 
+     main = "OOB Error vs Number of Trees",
+     col = "blue",
+     lwd = 2)
+abline(v = which.min(rf_oob_curve$mse), col = "red", lty = 2)
+```
+
+```{r}
+best_num_trees <- which.min(rf_oob_curve$mse)
+cat("Best number of trees based on OOB Error:", best_num_trees, "\n")
+```
+
+From the plot, we can see:
+- Early trees: error drops fast.
+- Later trees: error flattens out (diminishing returns).
+- Best spot: minimum point in curve, the elbow!
+Also, after 100 trees, the OOB error stops improving much, so that gives insight about threshold for further tuning.
+
+Beside impressive performance, Random Forest can test which variables are the best in predicting house price, which are useful information to communicate and report to people not in Stats. Top 40 predictors are seen as below:
+
+```{r}
+# Extract variable importance from the Random Forest model
+var_imp <- varImp(rf_model)$importance
+
+# Turn into a tidy dataframe
+var_imp_df <- var_imp %>%
+  mutate(Variable = rownames(var_imp)) %>%
+  arrange(desc(Overall))  # sort by importance
+
+# Top 20 variables
+var_imp_top20 <- var_imp_df %>%
+  slice_head(n = 40)
+
+ggplot(var_imp_top20, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +  # Flip axes: variables on Y, importance on X
+  labs(title = "Top 40 Variable Importances (Random Forest)",
+       x = "Variable",
+       y = "Importance Score") +
+  theme_minimal()
+```
+
+### 3.2.4. XGBoost
+
+Another potential model to fit is XGBoost (Extreme Gradient Boosting). It is a highly suitable model for predicting house prices because it is designed to work exceptionally well with structured tabular data. XGBoost also models non-linear relationships and complex feature interactions automatically. It also has built-in L1 and L2 regularization (via parameters like gamma, lambda, alpha), helping prevent overfitting on small datasets (but large proportion of predictors) like this housing data. With early stopping, XGBoost can automatically stop training when validation error stops improving, reducing training time and preventing unnecessary model complexity. In this experiment, I also utilize its built-in tools - early stopping to optimize training time and efficiency.
+
+```{r, warning=F}
+# Normal XGBoost
+library(xgboost)
+set.seed(05112025)
+
+# Define 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# Train XGBoost model
+cat("Training XGBoost Model...\n")
+start_time_xgb <- Sys.time()
+
+xgb_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "xgbTree",    # caret built-in support for XGBoost Trees
+  preProcess = c("center", "scale"),
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    nrounds = 500,               # number of boosting rounds, use 500 trees here
+    max_depth = c(3, 6, 9),       # depth of each tree
+    eta = c(0.01, 0.1, 0.3),      # learning rate
+    gamma = 0,                   # minimum loss reduction
+    colsample_bytree = 0.8,       # subsample ratio of columns
+    min_child_weight = 1,         # minimum sum of instance weight needed
+    subsample = 0.8               # subsample ratio of the training instance
+  ))
+
+end_time_xgb <- Sys.time()
+cat("XGBoost Training Time:", round(difftime(end_time_xgb, start_time_xgb, units = "mins"), 2), "minutes\n\n")
+
+# Predict using the trained XGBoost model
+pred_xgb <- predict(xgb_model, newdata = test)
+
+# Compute RMSE
+xgb_rmse <- sqrt(mean((y_true - pred_xgb)^2))
+cat("Test RMSE for XGBoost Model:", round(xgb_rmse, 4), "\n")
+
+# Extract best tuning parameters
+best_xgb_param <- xgb_model$bestTune
+
+# Display nicely with kable
+kable(best_xgb_param, caption = "Best Tuning Parameters for XGBoost Model (Selected by 5-Fold CV)")
+```
+
+```{r}
+# XGBoost with early stopping
+set.seed(05112025)
+# Make sure column names are clean
+colnames(train) <- make.names(colnames(train))
+colnames(test) <- make.names(colnames(test))
+
+# Prepare data matrices
+x_train <- as.matrix(train %>% select(-SalePrice))
+y_train <- train$SalePrice
+x_test <- as.matrix(test)
+
+# Watchlist
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest <- xgb.DMatrix(data = x_test, label = y_test)
+
+# Set XGBoost parameters
+xgb_params <- list(
+  objective = "reg:squarederror",   # Regression problem
+  max_depth = 6,                    # Tree depth
+  eta = 0.1,                        # Learning rate
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  eval_metric = "rmse")              # Evaluation metric
+
+# Start timing
+cat("Training XGBoost Model with Early Stopping...\n")
+start_time_xgb_early <- Sys.time()
+
+# Train XGBoost with early stopping
+set.seed(05112025)
+xgb_early <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 1000,            # Allow up to 1000 trees
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 20, # Stop early if no improvement in 20 rounds
+  print_every_n = 10,
+  maximize = FALSE)
+
+# End timing
+end_time_xgb_early <- Sys.time()
+cat("XGBoost Early Stopping Training Time:", round(difftime(end_time_xgb_early, start_time_xgb_early, units = "mins"), 2), "minutes\n\n")
+
+# Predict on test set
+pred_xgb_early <- predict(xgb_early, newdata = x_test)
+
+# Compute RMSE
+xgb_early_rmse <- sqrt(mean((y_test - pred_xgb_early)^2))
+cat("Test RMSE for XGBoost Model (Early Stopping):", round(xgb_early_rmse, 4), "\n")
+cat("Best number of trees (nrounds):", xgb_early$best_iteration, "\n")
+```
+
+Using XGBoost with no early stopping, test RMSE = 0.1188, best nrounds = 500. With early stopping, test RMSE = 0.1289, best validated nrounds (number of trees) is 133. I tried increasing the early_stopping_rounds and retuning other parameters in xgb_params but there is no improvement whatsoever. This implies that my model benefits from more trees, i.e growing up to 500 trees captured additional useful patterns and sometimes when early stopping stopped too early, results are not the best performance.
+
+### 3.2.5. Support Vector Machines
+
+Next experiment model is Support Vector Machine with a radial basis function (RBF) kernel. According to my research, "rbf" usually performs the best in modelling non-linear relationships between features and the target variable so using the kernel is a safe choice. Another reason is SVMs are very effective in high-dimensional spaces (my data) and can handle both numeric and transformed categorical variables very well after proper preprocessing. Using the kernel trick to map the input data into higher-dimensional space, the SVM can separate complex relationships that traditional linear models (OLS) might miss - my first model. Lastly, by tuning parameters such as the cost (C) and kernel width (sigma), SVMs provide a good balance between model complexity and generalization, making them a strong candidate for structured regression tasks like house price prediction.
+
+```{r, warning=F}
+set.seed(05112025)
+# Define 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# Train SVM model
+cat("Training SVM Model...\n")
+start_time_svm <- Sys.time()
+
+svm_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "svmRadial",             # Radial basis function (Gaussian kernel)
+  preProcess = c("center", "scale"), 
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    C = c(0.1, 1, 10, 100),    # Penalty for slack (complexity control)
+    sigma = c(0.01, 0.05, 0.1, 0.5, 1)          # Kernel width 
+  ))
+
+end_time_svm <- Sys.time()
+cat("SVM Training Time:", round(difftime(end_time_svm, start_time_svm, units = "mins"), 2), "minutes\n\n")
+# Predict using trained SVM model
+pred_svm <- predict(svm_model, newdata = test)
+
+# Compute RMSE
+svm_rmse <- sqrt(mean((y_true - pred_svm)^2))
+cat("Test RMSE for SVM Model:", round(svm_rmse, 4), "\n")
+# Extract best tuning parameters
+best_svm_param <- svm_model$bestTune
+
+# Display nicely with kable
+kable(best_svm_param, caption = "Best Tuning Parameter for SVM Model (Selected by 5-Fold CV)")
+```
+
+Using Support Vector Machines, test RMSE is 0.2047. Best hyperparamater from tuning are C = 10, sigma = 0.01.
+
+### 3.2.6. Neural Networks
+
+The last potential model is a single-hidden-layer feedforward neural network. It is a flexible algorithm that can approximate complex non-linear functions and learn the pattern in data very well thanks to its ability to back-propagate. In the context of house prices, where factors such as living ground area, overall quality, neighborhood, and various amenities interact in complex ways, neural networks can offer strong modeling capabilities because it can captures the noise very well. However, this is also a caveat, because when the dataset is a small-sized, Neural networks may risk overfitting.
+
+```{r, warning = F}
+library(nnet)    # caret uses 'nnet' package internally for neural nets
+set.seed(05112025)
+
+# Define 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# Train Neural Network model
+cat("Training Neural Network Model...\n")
+start_time_nn <- Sys.time()
+
+nn_model <- train(
+  SalePrice ~ ., 
+  data = train,
+  method = "nnet",
+  preProcess = c("center", "scale"),
+  trControl = train_control,
+  linout = TRUE,        # linear output (because we are doing regression)
+  trace = FALSE,        # turn off training output for cleaner output
+  tuneGrid = expand.grid(
+    size = c(3, 5, 7),  # number of neurons in the hidden layer (this range is small to moderate numbers of neurons)
+    decay = c(0.001, 0.01, 0.1)))  # regularization parameter
+
+end_time_nn <- Sys.time()
+cat("Neural Network Training Time:", round(difftime(end_time_nn, start_time_nn, units = "mins"), 2), "minutes\n\n")
+# Predict using trained Neural Network model
+pred_nn <- predict(nn_model, newdata = test)
+
+# Compute RMSE
+nn_rmse <- sqrt(mean((y_true - pred_nn)^2))
+cat("Test RMSE for Neural Network Model:", round(nn_rmse, 4), "\n")
+# Extract best tuning parameters
+best_nn_param <- nn_model$bestTune
+
+# Display nicely with kable
+kable(best_nn_param, caption = "Best Tuning Parameters for Neural Network Model (Selected by 5-Fold CV)")
+```
+Using neural Network, test RMSE = 0.2216. It is found that best hyperparamters are: size = 3, decay = 0.1.
+
+## 3.3 Optimization and performance evaluation
+
+Before selecting the optimal model for prediction, selection criteria is considered. In a regression problem, main performance metrics is test RMSE (Root Mean Square Error). In the context of my data, test RMSE measures the square root of the average squared differences between the predicted house prices and the actual prices in my test dataset. So, lower values indicate better model performance.
+
+As stated prior to training, the response variable (y) was transformed to log scale (ln(y)) in order to represent proportional errors rather than absolute dollar amounts, meaning a prediction error on a $100,000 house and a $1,000,000 house are weighted equally if they represent the same percentage difference. So the RMSE values in the table presented below (ranging from 0.1188 to 0.2216) can be transalted roughly to a 10%-20% error in the original price scale.   
+
+For example:
+- For a $300,000 house, an RMSE of 0.1188 (XGBoost) means predictions typically fall within approximately ±$36,000 of the actual price
+- For the same house, an RMSE of 0.2216 (Neural Network) means predictions typically fall within approximately ±$66,000
+
+This variance in estimation is very significant in real estate contexts, where pricing decisions often rely on comparable sales that can vary by similar margins.
+
+```{r}
+# Create a summary table
+model_summary <- tibble(
+  Model = c("LASSO", "Elastic Net", "Random Forest", "XGBoost (W/o Early Stopping)", "XGBoost (Early Stopping)", "SVM", "Neural Network"),
+  Training_Time_Minutes = c(
+    round(difftime(end_time_lasso, start_time_lasso, units = "mins"), 2),
+    round(difftime(end_time_enet, start_time_enet, units = "mins"), 2),
+    round(difftime(end_time_rf, start_time_rf, units = "mins"), 2),
+    round(difftime(end_time_xgb, start_time_xgb, units = "mins"), 2),
+    round(difftime(end_time_xgb_early, start_time_xgb_early, units = "mins"), 2),
+    round(difftime(end_time_svm, start_time_svm, units = "mins"), 2),
+    round(difftime(end_time_nn, start_time_nn, units = "mins"), 2)),
+  Test_RMSE = c(
+    round(lasso_rmse, 4),
+    round(elasticnet_rmse, 4),
+    round(rf_rmse, 4),
+    round(xgb_rmse, 4),
+    round(xgb_early_rmse, 4),
+    round(svm_rmse, 4),
+    round(nn_rmse, 4)))
+
+# Display the table 
+kable(model_summary, caption = "Comparison of Housing Price Prediction Models")
+```
+
+As seen from the summary table above, among the models evaluated, the XGBoost model (without Early Stopping) has the lowest test RMSE. However, its training time is significantly longer than the others. Thus, XGBoost (with Early Stopping) can be a better fit as it ranks second in test RMSE but is substantially faster than all the other models. Computation is resource is especially important if we have medium to big size sample, and that's usually what makes all the machine learning possible. So balancing between training speed and efficiency should be a priority. Therefore, XGBoost using Early Stopping would be my final chosen model. Its tuned hyperparamters is nrounds (number of trees) = 133.
+
+Moving forward, if we want to interpret the predicted value/error from any model, we can just take the exponential of the predicted value/error.
+
+# IV. Conclusion 
+
+Overall, this project showcased the importance of thorough data cleaning, feature engineering, and feature/model selection when tackling real-world structured regression problems. Visualizations of numerical and categorical variables highlighted important trends, such as the positive relationship between overall quality, total area, and sale price, which then confirmed by Feature Importance graph from random forest.
+
+In terms of modelling, multiple machine learning models were trained and evaluated, including LASSO, Elastic Net, Random Forest, XGBoost (with and without early stopping), Support Vector Machines, and Neural Networks. Each model was carefully tuned using cross-validation, and model performance was assessed through Test RMSE. Among these models, XGBoost with early stopping was chosen as the strongest predictive model, while simpler models like LASSO provided useful baselines with greater interpretability and still guarantees good performance. 
+
+These insights about the hyoperparameter tuning, data visualization and model evaluation can ultimately inform future efforts to refine predictions, optimize housing price estimations, and deploy predictive models in practice. 
